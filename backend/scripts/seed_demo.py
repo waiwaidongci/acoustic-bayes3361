@@ -6,6 +6,7 @@ from src.models.user import User
 from src.models.source import Source
 from src.models.record import Record
 from src.models.run import Run
+from src.models.packet import Packet
 from src.models import note,audit
 from src.utils.security import hash_password
 from src.utils.serialization import now
@@ -53,6 +54,11 @@ def seed():
                 records=[{'id':r.id,'source_id':r.source_id,'reference':r.reference,'values':r.values} for r in db.scalars(select(Record).where(Record.source_id==source.id).order_by(Record.id))]
                 run=Run(source_id=source.id,name='首轮种子研究',state='queued',parameters=CONFIG['default_parameters'],snapshot={'source':{'id':source.id,'name':source.name,'filename':source.filename},'records':records},created_at=now());db.add(run);db.flush();queued.append(run.id)
         db.commit();print(json.dumps(counts(db),ensure_ascii=False))
+        try:
+            from scripts.seed_packet import seed_packet
+            packet=seed_packet(db)
+            if packet:print(json.dumps({'judgement_packet':packet},ensure_ascii=False))
+        except Exception:logging.exception('seed packet failed; demo remains available')
     for id in queued:
         try:queue.rpush('analysis:queue',id)
         except Exception:logging.exception('seed queue unavailable')

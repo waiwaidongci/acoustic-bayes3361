@@ -13,7 +13,8 @@ GaussianNB与分层交叉验证、混淆矩阵和后验解释。为桐弦研究�
 3. 分析配置：冻结来源、参数和全部样本，进入Redis队列。
 4. 完整结果：真实算法摘要、专属诊断、全部CSV导出和可恢复失败态。
 5. 复检批注：分析师草案→负责人批准→阅读者下载批准快照。
-6. 审计：登录、来源修改、任务worker完成、业务说明批准等事件。
+6. 判读册核验：合作站按分片送来的判读结果册逐片接收、封包、独立复算逐件核对，通过后整册入库。
+7. 审计：登录、来源修改、任务worker完成、业务说明批准、判读册收件/封包/入库等事件。
 
 ## 快速启动
 
@@ -70,6 +71,22 @@ GaussianNB与分层交叉验证、混淆矩阵和后验解释，全部计算位�
 
 已知边界：独立同分布、特征条件独立和高斯类条件是假设；后验未校准。演示数据刻意有分离度，准确率不代表真实设备效果。使用分层折外验证，不提供外部最终测试集。
 
+## 判读册核验（合作站送检）
+
+合作站送来的判读册准确率相同也可能有错，因此本模块不信任来件：先锁定样本次序与研究参数，再由**独立于 `algorithm.py` 的流式实现**逐件复算归折、预测与后验，有分歧即在首处报告并整册退回；全部一致才整册入库。
+
+处理流程与保证：
+
+1. **分片接收**：`POST /packets` 建册并冻结参数与期望件数；`POST /packets/{id}/shards` 逐片收件。分片可任意乱序到达；`shard_key` 为自然键，同一分片原样重试只回 `duplicate`、不重复收件；同一分片以不同内容重试被 `409` 拒绝。
+2. **同位置异值隔离**：已收位置再来不同值不会被覆盖，而是进入 `judgement_conflicts` 隔离区；未处理前不可封包。负责人用 `POST /packets/{id}/conflicts/{cid}/resolve` 选择保留原值或采用来件。
+3. **封包锁定**：收件齐全且无未处理异值后可 `POST /packets/{id}/seal`，冻结次序（位置 1..N）、参数与逐件内容 SHA256；封包后不再接收新分片。
+4. **独立复算**：`packet_worker.py` 不使用 scikit-learn，流水线复现 `StratifiedKFold(shuffle=True, random_state=42)` 的归折顺序，并以补偿式 Welford 累加器逐折、逐类拟合。每折都用**包内全部训练样本**拟合（从不只看某一片），内存为 O(折×类×特征)，与件数无关。
+5. **逐件比对**：每件核对方 `claimed_fold`、`claimed_predicted` 与 `claimed_posterior`（容差 `1e-9`）；首个不符即记录位置、样本编号、实际类型、来件值与复算值，状态置 `failed`，**整册不入库**。
+6. **断点恢复**：结构、标准化、模型、逐件四个阶段分别落库检查点，逐件阶段每 1000 件落一次；进程中断后重新入队即可从最后确认位置继续。并发 worker 通过数据库租约与版本令牌互斥，补片与封包不混版。
+7. **整册入库**：所有件核对通过后，负责人 `POST /packets/{id}/admit` 才写入 `judgement_admissions`；同一 `book_key` 只保留一册，重复送达返回已存在而不产生第二册。封包后任何被改动的样本都会因内容哈希不符在结构阶段被 `rejected`。
+
+研究页面的“判读册核验”模块可查看收件进度、缺位、隔离冲突、首处分歧与逐件明细；核验结果同时写入审计。参数与逐件判据同时暴露在 `GET /packets/{id}`。
+
 ## 演示数据与一天剧本
 
 固定seed=42，3个来源 ` TX-202611-01/02/03`，每来源240条，共720条业务记录；三个账号和首轮种子任务。自然键检查后仅插入缺失数据，连跑seed不重复、不覆盖用户修改。`SEED_DEMO=true` 时启动自动执行；失败记录日志但不阻塞服务。首轮任务同样由独立worker真实计算。
@@ -103,6 +120,8 @@ backend/migrations/001_initial.sql
 | DATABASE_URL / REDIS_URL | Compose内部连接，定义在compose的env锚点 |
 | ARTIFACT_DIR | `/artifacts`，后端worker共享 |
 
-共享枚举：`backend/src/constants/enums.py` 与 `frontend/src/constants/enums.js` 都定义 admin/analyst/viewer、queued/running/completed/failed、draft/approved。后端service检查对应字符串；README为全量值说明。共享前端组件table/status/chart/business跨总览、结果、配置与复核复用；actions hook和format utils负责交互/格式。后端errors与rate_limit是两个中间件。
+共享枚举：`backend/src/constants/enums.py` 与 `frontend/src/constants/enums.js` 都定义 admin/analyst/viewer、queued/running/completed/failed、draft/approved，前端另有判读册状态 collecting/sealed/verifying/verified/failed/rejected/admitted（中文见 `packetStates`）。后端service检查对应字符串；README为全量值说明。共享前端组件table/status/chart/business/packet跨总览、结果、配置、复核与判读册核验复用；actions hook和format utils负责交互/格式。后端errors与rate_limit是两个中间件。
 
-测试及截图在批根 `test-artifacts/gb-0041/`，不混入源码。独立算法oracle、HTTP完整流程和真实Playwright浏览器流程见该目录 `TESTING.md`。License：MIT。
+判读册核验相关文件：`backend/src/models/packet.py`、`schemas/packet.py`、`services/packets.py`（收件/封包/冲突/入库）、`services/verification.py`（独立流式算法）、`services/packet_worker.py`（检查点与租约）、`routes/packets.py`；前端 `api/packets.js`、`components/common/packet.js`、`pages/packets.js`。worker 同时消费 `analysis:queue` 与 `packet:verify` 两个Redis队列。
+
+测试及截图在批根 `test-artifacts/gb-0041/`，不混入源码。独立算法oracle、HTTP完整流程、判读册核验（乱序/重试/隔离/篡改/并发/断点/10万条定内存）和真实Playwright浏览器流程见该目录 `TESTING.md`。License：MIT。

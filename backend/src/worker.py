@@ -4,10 +4,11 @@ from sqlalchemy import select
 from .config.database import Session
 from .config.settings import REDIS_URL,ARTIFACT_DIR
 from .models.run import Run
-from .models import source,record,user,note,audit
+from .models import source,record,user,note,audit,packet
 from .services.algorithm import calculate
 from .services.audit import log
 from .services.export import csv_response
+from .services.packet_worker import verify_once
 queue=Redis.from_url(REDIS_URL)
 ARTIFACT_DIR.mkdir(parents=True,exist_ok=True)
 def execute(id):
@@ -26,9 +27,23 @@ def execute(id):
             logging.exception('analysis failed');r.state='failed';r.error=str(e)[:2000]
             log(db,'worker','run.failed',r.id,r.error)
         db.commit()
+def heartbeat():
+    (ARTIFACT_DIR/'heartbeat').write_text(str(time.time()))
+def verify_packet(id):
+    with Session() as db:
+        try:
+            outcome=verify_once(db,id,heartbeat)
+            logging.info('packet %s verification: %s',id,outcome.get('status'))
+        except Exception:
+            logging.exception('packet verification crashed')
 def main():
     while True:
-        (ARTIFACT_DIR/'heartbeat').write_text(str(time.time()))
-        value=queue.blpop('analysis:queue',timeout=2)
-        if value:execute(int(value[1]))
+        heartbeat()
+        value=queue.blpop(['packet:verify','analysis:queue'],timeout=2)
+        if not value:continue
+        queue_name,raw=value
+        try:item_id=int(raw)
+        except (TypeError,ValueError):continue
+        if queue_name==b'packet:verify':verify_packet(item_id)
+        else:execute(item_id)
 if __name__=='__main__':main()
